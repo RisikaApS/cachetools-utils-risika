@@ -269,9 +269,11 @@ class RedisCache(MutMap):
             return True
         else:
             self._circuit_breaker_until = None
+            print("Disabling REDIS circuit breaker")
             return False
 
     def _set_circuit_breaker_on(self):
+        print("Enabling REDIS circuit breaker")
         self._circuit_breaker_until = datetime.datetime.now() + datetime.timedelta(minutes=1)
 
     def __getitem__(self, index):
