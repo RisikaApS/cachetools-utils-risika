@@ -1,9 +1,9 @@
 """
-CacheTools Utilities
+CacheTools Utilities Risika Version
 
 This code is public domain.
 """
-
+import datetime
 from typing import Any, Callable, Union, MutableMapping as MutMap
 
 import cachetools
@@ -250,6 +250,7 @@ class RedisCache(MutMap):
     def __init__(self, cache, ttl=600):
         self._cache = cache
         self._ttl = ttl
+        self._circuit_breaker_until = None
 
     def clear(self):  # pragma: no cover
         return self._cache.flushdb()
@@ -263,21 +264,56 @@ class RedisCache(MutMap):
     def _key(self, key):
         return json.dumps(key)
 
+    def _circuit_breaker_on(self):
+        if self._circuit_breaker_until and self._circuit_breaker_until > datetime.datetime.now():
+            return True
+        else:
+            self._circuit_breaker_until = None
+            return False
+
+    def _set_circuit_breaker_on(self):
+        self._circuit_breaker_until = datetime.datetime.now() + datetime.timedelta(minutes=1)
+
     def __getitem__(self, index):
-        val = self._cache.get(self._key(index))
+        if self._circuit_breaker_on():
+            raise KeyError()
+        try:
+            val = self._cache.get(self._key(index))
+        except Exception:
+            self._set_circuit_breaker_on()
+            raise KeyError()
+
         if val:
             return self._deserialize(val)
         else:
             raise KeyError()
 
     def __setitem__(self, index, value):
-        return self._cache.set(self._key(index), self._serialize(value), ex=self._ttl)
+        if self._circuit_breaker_on():
+            return
+        try:
+            return self._cache.set(self._key(index), self._serialize(value), ex=self._ttl)
+        except Exception:
+            self._set_circuit_breaker_on()
+            return
 
     def __delitem__(self, index):
-        return self._cache.delete(self._key(index))
+        if self._circuit_breaker_on():
+            return 0
+        try:
+            return self._cache.delete(self._key(index))
+        except Exception:
+            self._set_circuit_breaker_on()
+            return
 
     def __len__(self):
-        return self._cache.dbsize()
+        if self._circuit_breaker_on():
+            return 0
+        try:
+            return self._cache.dbsize()
+        except Exception:
+            self._set_circuit_breaker_on()
+            return 0
 
     def __iter__(self):
         raise Exception("not implemented yet")
@@ -290,9 +326,15 @@ class RedisCache(MutMap):
 
     # also forward Redis set/get/delete
     def set(self, index, value, **kwargs):
+        if self._circuit_breaker_on():
+            return
         if "ex" not in kwargs:  # pragma: no cover
             kwargs["ex"] = self._ttl
-        return self._cache.set(self._key(index), self._serialize(value), **kwargs)
+        try:
+            return self._cache.set(self._key(index), self._serialize(value), **kwargs)
+        except Exception:
+            self._set_circuit_breaker_on()
+            return
 
     def get(self, index, default=None):
         return self[index]
