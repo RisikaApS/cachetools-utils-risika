@@ -4,6 +4,8 @@ CacheTools Utilities Risika Version
 This code is public domain.
 """
 import datetime
+import decimal
+import sys
 from typing import Any, Callable, Union, MutableMapping as MutMap
 
 import cachetools
@@ -243,6 +245,47 @@ class StatsMemCached(MemCached):
 # REDIS
 #
 
+class RedisJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime.datetime):
+            ARGS = ('year', 'month', 'day', 'hour', 'minute',
+                     'second', 'microsecond')
+            return {'__type__': 'datetime.datetime',
+                    'args': [getattr(obj, a) for a in ARGS]}
+        elif isinstance(obj, datetime.date):
+            ARGS = ('year', 'month', 'day')
+            return {'__type__': 'datetime.date',
+                    'args': [getattr(obj, a) for a in ARGS]}
+        elif isinstance(obj, datetime.time):
+            ARGS = ('hour', 'minute', 'second', 'microsecond')
+            return {'__type__': 'datetime.time',
+                    'args': [getattr(obj, a) for a in ARGS]}
+        elif isinstance(obj, datetime.timedelta):
+            ARGS = ('days', 'seconds', 'microseconds')
+            return {'__type__': 'datetime.timedelta',
+                    'args': [getattr(obj, a) for a in ARGS]}
+        elif isinstance(obj, decimal.Decimal):
+            return {'__type__': 'decimal.Decimal',
+                    'args': [str(obj),]}
+        else:
+            return super().default(obj)
+
+
+class RedisJSONDecoder(json.JSONDecoder):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, object_hook=self.object_hook,
+                         **kwargs)
+
+    def object_hook(self, d):
+        if '__type__' not in d:
+            return d
+        o = sys.modules[__name__]
+        for e in d['__type__'].split('.'):
+            o = getattr(o, e)
+        args, kwargs = d.get('args', ()), d.get('kwargs', {})
+        return o(*args, **kwargs)
+
 
 class RedisCache(MutMap):
     """Redis wrapper for cachetools."""
@@ -256,10 +299,10 @@ class RedisCache(MutMap):
         return self._cache.flushdb()
 
     def _serialize(self, s):
-        return json.dumps(s)
+        return json.dumps(s, cls=RedisJSONEncoder)
 
     def _deserialize(self, s):
-        return json.loads(s)
+        return json.loads(s, cls=RedisJSONDecoder)
 
     def _key(self, key):
         return json.dumps(key)
