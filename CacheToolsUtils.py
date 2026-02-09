@@ -11,9 +11,11 @@ from typing import Any, Callable, Union, MutableMapping as MutMap
 import cachetools
 import json
 
-import pkg_resources as pkg  # type: ignore
-
-__version__ = pkg.require("CacheToolsUtils")[0].version
+try:
+    from importlib.metadata import version
+    __version__ = version("CacheToolsUtils")
+except Exception:
+    __version__ = "0.0.0"
 
 import logging
 
