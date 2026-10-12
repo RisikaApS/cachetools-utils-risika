@@ -380,3 +380,57 @@ def test_corners():
         assert False, "exception must be raised"
     except Exception as e:
         assert "Unknown serialization format" in str(e)
+
+
+class _StubRedis:
+    """Minimal in-memory stand-in for redis.Redis; fail=True raises like an outage."""
+
+    def __init__(self):
+        self.data, self.fail = {}, False
+
+    def _check(self):
+        if self.fail:
+            raise ConnectionError("redis down")
+
+    def get(self, k):
+        self._check()
+        return self.data.get(k)
+
+    def set(self, k, v, **kwargs):
+        self._check()
+        self.data[k] = v
+        return True
+
+    def delete(self, k):
+        self._check()
+        return 1 if self.data.pop(k, None) is not None else 0
+
+    def dbsize(self):
+        self._check()
+        return len(self.data)
+
+
+def test_redis_unserialisable_value_does_not_open_breaker():
+    stub = _StubRedis()
+    c = ctu.PrefixedRedisCache(stub, "t.")
+    c["a"] = {"x"}                      # a set: not JSON-serialisable
+    assert "t.a" not in stub.data       # skipped, not cached
+    assert c._circuit_breaker_until is None
+    c["b"] = [1, 2]                     # Redis still in use for other keys
+    assert c["b"] == [1, 2]
+
+
+def test_redis_outage_opens_breaker_and_bypasses_redis():
+    stub = _StubRedis()
+    c = ctu.PrefixedRedisCache(stub, "t.")
+    stub.fail = True
+    c["a"] = 1                          # connection error opens the breaker
+    assert c._circuit_breaker_until is not None
+    stub.fail = False
+    c["b"] = 2                          # breaker open: write skipped
+    assert "t.b" not in stub.data
+    try:
+        c["b"]
+        assert False, "expected KeyError while the breaker is open"
+    except KeyError:
+        pass
