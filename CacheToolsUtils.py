@@ -296,6 +296,7 @@ class RedisCache(MutMap):
         self._cache = cache
         self._ttl = ttl
         self._circuit_breaker_until = None
+        self._unserialisable_logged = set()
 
     def clear(self):  # pragma: no cover
         return self._cache.flushdb()
@@ -310,24 +311,45 @@ class RedisCache(MutMap):
         return json.dumps(key)
 
     def _circuit_breaker_on(self):
-        if self._circuit_breaker_until and self._circuit_breaker_until > datetime.datetime.now():
-            return True
-        else:
-            self._circuit_breaker_until = None
-            print("Disabling REDIS circuit breaker")
+        if self._circuit_breaker_until is None:
             return False
+        if self._circuit_breaker_until > datetime.datetime.now():
+            return True
+        self._circuit_breaker_until = None
+        log.warning("REDIS circuit breaker closed, using Redis again")
+        return False
 
-    def _set_circuit_breaker_on(self):
-        print("Enabling REDIS circuit breaker")
+    def _set_circuit_breaker_on(self, exc=None):
+        # Only Redis/connection failures open the breaker; it bypasses Redis for
+        # a minute for every caller sharing this instance.
+        if self._circuit_breaker_until is None:
+            log.warning("REDIS circuit breaker opened for 1 minute: %s: %s",
+                        type(exc).__name__, exc)
         self._circuit_breaker_until = datetime.datetime.now() + datetime.timedelta(minutes=1)
+
+    def _serialize_or_skip(self, index, value):
+        """Serialise value, or return None when it is not JSON-serialisable.
+
+        An unserialisable value is a caller bug for that one key, not a Redis
+        outage, so it must not open the circuit breaker (which would switch Redis
+        off for every other key too). The value is simply not cached."""
+        try:
+            return self._serialize(value)
+        except (TypeError, ValueError) as e:
+            kind = type(value).__name__
+            if kind not in self._unserialisable_logged:
+                self._unserialisable_logged.add(kind)
+                log.warning("REDIS cache: not caching unserialisable %s for key %s: %s",
+                            kind, self._key(index), e)
+            return None
 
     def __getitem__(self, index):
         if self._circuit_breaker_on():
             raise KeyError()
         try:
             val = self._cache.get(self._key(index))
-        except Exception:
-            self._set_circuit_breaker_on()
+        except Exception as e:
+            self._set_circuit_breaker_on(e)
             raise KeyError()
 
         if val:
@@ -338,10 +360,13 @@ class RedisCache(MutMap):
     def __setitem__(self, index, value):
         if self._circuit_breaker_on():
             return
+        data = self._serialize_or_skip(index, value)
+        if data is None:
+            return
         try:
-            return self._cache.set(self._key(index), self._serialize(value), ex=self._ttl)
-        except Exception:
-            self._set_circuit_breaker_on()
+            return self._cache.set(self._key(index), data, ex=self._ttl)
+        except Exception as e:
+            self._set_circuit_breaker_on(e)
             return
 
     def __delitem__(self, index):
@@ -349,8 +374,8 @@ class RedisCache(MutMap):
             return 0
         try:
             return self._cache.delete(self._key(index))
-        except Exception:
-            self._set_circuit_breaker_on()
+        except Exception as e:
+            self._set_circuit_breaker_on(e)
             return
 
     def __len__(self):
@@ -358,8 +383,8 @@ class RedisCache(MutMap):
             return 0
         try:
             return self._cache.dbsize()
-        except Exception:
-            self._set_circuit_breaker_on()
+        except Exception as e:
+            self._set_circuit_breaker_on(e)
             return 0
 
     def __iter__(self):
@@ -377,10 +402,13 @@ class RedisCache(MutMap):
             return
         if "ex" not in kwargs:  # pragma: no cover
             kwargs["ex"] = self._ttl
+        data = self._serialize_or_skip(index, value)
+        if data is None:
+            return
         try:
-            return self._cache.set(self._key(index), self._serialize(value), **kwargs)
-        except Exception:
-            self._set_circuit_breaker_on()
+            return self._cache.set(self._key(index), data, **kwargs)
+        except Exception as e:
+            self._set_circuit_breaker_on(e)
             return
 
     def get(self, index, default=None):
